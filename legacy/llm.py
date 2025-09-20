@@ -21,6 +21,9 @@ import pickle
 from torchtune.modules import RotaryPositionalEmbeddings
 warnings.filterwarnings('ignore')
 
+# If triton error comes up do the below
+torch._dynamo.config.suppress_errors = True
+
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility"""
     random.seed(seed)
