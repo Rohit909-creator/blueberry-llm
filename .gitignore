@@ -212,3 +212,4 @@ __marimo__/
 # Cache
 data_cache/
 /blueberryenv
+test.ipynb

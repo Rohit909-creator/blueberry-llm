@@ -71,6 +71,9 @@ class MoEModelConfig:
     num_experts: int = 8
     expert_top_k: int = 2
     load_balancing_weight: float = 0.01
+    
+    window_size: int = 4
+    lambda_top: float = 0.3
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
@@ -451,8 +454,9 @@ class MoEMinimalLLM(nn.Module):
 
         # Language modeling head (tied with embeddings)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.top_head = nn.Linear(config.d_model, config.vocab_size)
         self.lm_head.weight = self.token_embedding.weight
-
+        self.last_hidden_state = None
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -463,7 +467,7 @@ class MoEMinimalLLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, return_aux_loss=True):
+    def forward(self, x, return_aux_loss=True, return_top_logits = False):
         # Token embeddings
         x = self.token_embedding(x) * math.sqrt(self.config.d_model)
         x = self.position_dropout(x)
@@ -480,13 +484,22 @@ class MoEMinimalLLM(nn.Module):
         # Output projection
         x = self.norm(x)
         x = self.output_dropout(x)
+        self.last_hidden_state = x
         logits = self.lm_head(x)
-
+        
+        if self.training:
+            
+            top_logits = self.top_head(self.last_hidden_state)
+            
         # Combine auxiliary losses
         total_aux_loss = sum(aux_losses) if aux_losses else None
 
+        if return_aux_loss and return_top_logits:
+            return logits, top_logits, total_aux_loss
+
         if return_aux_loss:
             return logits, total_aux_loss
+        
         return logits
 
 def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelConfig):
@@ -544,6 +557,154 @@ def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
 
     return [muon_optimizer, adamw_optimizer]
 
+def build_top_targets_batch_sparse(batch_token_ids, W, vocab_size):
+    """
+    Sparse, VRAM-friendly version of build_top_targets_batch.
+    Returns sparse indices and values instead of dense tensor.
+    
+    Args:
+        batch_token_ids: LongTensor [B, T_plus_W]
+        W: window size
+        vocab_size: vocabulary size
+        
+    Returns:
+        dict with 'indices', 'values', 'shape' for sparse tensor construction
+    """
+    B, S = batch_token_ids.shape
+    T = S - W
+    device = batch_token_ids.device
+    
+    # Collect non-zero entries
+    batch_indices = []
+    position_indices = []
+    vocab_indices = []
+    values = []
+    
+    for b in range(B):
+        seq = batch_token_ids[b]
+        
+        # Track last occurrence of each token efficiently
+        last_pos = torch.full((vocab_size,), S + 1, dtype=torch.long, device=device)
+        
+        # Process sequence backwards
+        for idx in range(S - 1, -1, -1):
+            tok = seq[idx].item()
+            if 0 <= tok < vocab_size:
+                last_pos[tok] = idx
+                
+            if idx < T:  # Only compute scores for positions we need
+                # Find tokens within window
+                distances = last_pos - idx
+                valid_mask = (distances > 0) & (distances <= W)
+                
+                if valid_mask.any():
+                    valid_tokens = torch.where(valid_mask)[0]
+                    valid_distances = distances[valid_tokens]
+                    scores = W - valid_distances
+                    
+                    # Store sparse entries
+                    num_valid = len(valid_tokens)
+                    batch_indices.extend([b] * num_valid)
+                    position_indices.extend([idx] * num_valid)
+                    vocab_indices.extend(valid_tokens.tolist())
+                    values.extend(scores.tolist())
+    
+    if not values:  # No valid entries
+        indices = torch.zeros((3, 0), dtype=torch.long, device=device)
+        values = torch.zeros(0, device=device)
+    else:
+        indices = torch.tensor([batch_indices, position_indices, vocab_indices], 
+                             dtype=torch.long, device=device)
+        values = torch.tensor(values, dtype=torch.float, device=device)
+    
+    return {
+        'indices': indices,
+        'values': values, 
+        'shape': (B, T, vocab_size)
+    }
+
+def sparse_top_loss(top_logits, sparse_targets, reduction='batchmean'):
+    """
+    Compute TOP loss using sparse targets.
+    
+    Args:
+        top_logits: [B, T, V] predicted logits
+        sparse_targets: dict with sparse target info
+        reduction: loss reduction method
+        
+    Returns:
+        loss value
+    """
+    B, T, V = top_logits.shape
+    device = top_logits.device
+    
+    # Get sparse target data
+    indices = sparse_targets['indices']  # [3, num_entries]
+    values = sparse_targets['values']    # [num_entries]
+    # print(f'Indices:{indices.shape}, values:{values.shape}')
+    if len(values) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Extract coordinates
+    b_idx, t_idx, v_idx = indices[0], indices[1], indices[2]
+    
+    # Get corresponding predictions
+    pred_logits = top_logits[b_idx, t_idx]  # [num_entries, V]
+    pred_log_probs = F.log_softmax(pred_logits, dim=-1)
+    
+    # Create sparse target probabilities for each entry
+    target_scores = torch.full((len(values), V), -1e9, device=device)
+    target_scores[torch.arange(len(values)), v_idx] = values
+    target_probs = F.softmax(target_scores, dim=-1)
+    
+    # Compute KL divergence
+    loss = F.kl_div(pred_log_probs, target_probs, reduction='sum')
+    
+    if reduction == 'batchmean':
+        loss = loss / B
+    elif reduction == 'mean':
+        loss = loss / (B * T)
+        
+    return loss
+
+# Alternative: Even more memory efficient version using chunked processing
+def build_top_targets_batch_chunked(batch_token_ids, W, vocab_size, chunk_size=32):
+    """
+    Process in chunks to handle very large batches with minimal memory.
+    """
+    B, S = batch_token_ids.shape
+    T = S - W
+    device = batch_token_ids.device
+    
+    all_indices = []
+    all_values = []
+    
+    for chunk_start in range(0, B, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, B)
+        chunk_data = batch_token_ids[chunk_start:chunk_end]
+        
+        sparse_chunk = build_top_targets_batch_sparse(chunk_data, W, vocab_size)
+        
+        if len(sparse_chunk['values']) > 0:
+            # Adjust batch indices for chunk offset
+            chunk_indices = sparse_chunk['indices'].clone()
+            chunk_indices[0] += chunk_start
+            
+            all_indices.append(chunk_indices)
+            all_values.append(sparse_chunk['values'])
+    
+    if all_indices:
+        indices = torch.cat(all_indices, dim=1)
+        values = torch.cat(all_values)
+    else:
+        indices = torch.zeros((3, 0), dtype=torch.long, device=device)
+        values = torch.zeros(0, device=device)
+    
+    return {
+        'indices': indices,
+        'values': values,
+        'shape': (B, T, vocab_size)
+    }
 
 def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader: DataLoader):
     """Train the MoE model"""
@@ -600,11 +761,18 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
             # Forward pass
             if config.use_amp:
                 with autocast():
-                    logits, aux_loss = model(x, return_aux_loss=True)
+                    logits, top_logits, aux_loss = model(x, return_aux_loss=True, return_top_logits=True)
                     ce_loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
-
-                    # Combine main loss and auxiliary loss
-                    total_loss = ce_loss
+                    
+                    # Sparse TOP loss computation
+                    sparse_targets = build_top_targets_batch_sparse(x, W=4, vocab_size=config.vocab_size)
+                    # print(f"top_logits:{top_logits.shape}")
+                    # exit(0)
+                    top_loss = sparse_top_loss(top_logits, sparse_targets, reduction='batchmean')
+                    
+                    # Combine losses
+                    c_loss = ce_loss + config.lambda_top * top_loss
+                    total_loss = c_loss
                     if aux_loss is not None:
                         total_loss = total_loss + aux_loss
 
